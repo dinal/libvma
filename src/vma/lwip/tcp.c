@@ -1163,6 +1163,7 @@ tcp_tx_pbuf_alloc(struct tcp_pcb * pcb, u16_t length, pbuf_type type)
 	p->ref = 1;
 	/* set flags */
 	p->flags = 0;
+	p->is_data_set = 0;
 	return p;
 }
 

@@ -85,6 +85,9 @@ struct pbuf {
   /** pointer to the actual data in the buffer */
   void *payload;
 
+  void *data;
+  u8_t is_data_set;
+
   /**
    * total length of this buffer and all next buffers in chain
    * belonging to the same packet.

@@ -516,7 +516,10 @@ tcp_write(struct tcp_pcb *pcb, const void *arg, u32_t len, u8_t apiflags)
       }
       LWIP_ASSERT("tcp_write: check that first pbuf can hold the complete seglen",
                   (p->len >= seglen));
-      TCP_DATA_COPY2((char *)p->payload + optlen, (u8_t*)arg + pos, seglen, &chksum, &chksum_swapped);
+      //printf("DINA0, allocated pbuf of size=(optlen=%d + seglen=%d), going to copy seglen bytes, p->len=%d, p->tot_len=%d \n", optlen, seglen, p->len, p->tot_len);
+	 // TCP_DATA_COPY2((char *)p->payload + optlen, (u8_t*)arg + pos, seglen, &chksum, &chksum_swapped);
+	  p->data = (u8_t*)arg + pos;
+	  p->is_data_set = 1;
     } else {
     	LWIP_ASSERT("tcp_write: we are never here",0);
     	goto memerr;
@@ -536,6 +539,7 @@ tcp_write(struct tcp_pcb *pcb, const void *arg, u32_t len, u8_t apiflags)
     if ((seg = tcp_create_segment(pcb, p, 0, pcb->snd_lbb + pos, optflags)) == NULL) {
       goto memerr;
     }
+    seg->dataptr = (u8_t*)arg + pos;
 #if TCP_OVERSIZE_DBGCHECK
     seg->oversize_left = oversize;
 #endif /* TCP_OVERSIZE_DBGCHECK */
@@ -548,7 +552,6 @@ tcp_write(struct tcp_pcb *pcb, const void *arg, u32_t len, u8_t apiflags)
     if ((apiflags & TCP_WRITE_FLAG_COPY) == 0) {
       seg->dataptr = (u8_t*)arg + pos;
     }
-
     /* first segment of to-be-queued data? */
     if (queue == NULL) {
       queue = seg;

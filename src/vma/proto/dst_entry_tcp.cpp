@@ -71,7 +71,6 @@ ssize_t dst_entry_tcp::fast_send(const struct iovec* p_iov, const ssize_t sz_iov
 	size_t total_packet_len = 0;
 	// The header is aligned for fast copy but we need to maintain this diff in order to get the real header pointer easily
 	size_t hdr_alignment_diff = m_header.m_aligned_l2_l3_len - m_header.m_total_hdr_len;
-
 	tcp_iovec* p_tcp_iov = NULL;
 	bool no_copy = true;
 	if (likely(sz_iov == 1 && !is_rexmit)) {
@@ -89,31 +88,49 @@ ssize_t dst_entry_tcp::fast_send(const struct iovec* p_iov, const ssize_t sz_iov
 		m_p_ring->inc_ring_stats(m_id);
 
 	if (likely(no_copy)) {
-		p_pkt = (tx_packet_template_t*)((uint8_t*)p_tcp_iov[0].iovec.iov_base - m_header.m_aligned_l2_l3_len);
+		//dst_tcp_loginfo("DINA no_copy, data_set=%d, packet len=%d total_header=%d, aligned=%d, ip_header=%d, alignemnet=%d, tcp_hdr=%d\n",
+			//	((struct pbuf *)p_tcp_iov->p_desc)->is_data_set, p_tcp_iov[0].iovec.iov_len, m_header.m_total_hdr_len,
+			//	m_header.m_aligned_l2_l3_len, m_header.m_ip_header_len, hdr_alignment_diff, sizeof(struct tcphdr));
+
 		total_packet_len = p_tcp_iov[0].iovec.iov_len + m_header.m_total_hdr_len;
-		m_header.copy_l2_ip_hdr(p_pkt);
-		// We've copied to aligned address, and now we must update p_pkt to point to real
-		// L2 header
-		//p_pkt = (tx_packet_template_t*)((uint8_t*)p_pkt + hdr_alignment_diff);
-		p_pkt->hdr.m_ip_hdr.tot_len = (htons)(p_tcp_iov[0].iovec.iov_len + m_header.m_ip_header_len);
-
-		m_sge[0].addr = (uintptr_t)((uint8_t*)p_pkt + hdr_alignment_diff);
-		m_sge[0].length = total_packet_len;
-
-		/* for DEBUG */
-		if ((uint8_t*)m_sge[0].addr < p_tcp_iov[0].p_desc->p_buffer || (uint8_t*)p_pkt < p_tcp_iov[0].p_desc->p_buffer) {
-			dst_tcp_logerr("p_buffer - addr=%d, m_total_hdr_len=%zd, p_buffer=%p, type=%d, len=%d, tot_len=%d, payload=%p, hdr_alignment_diff=%zd\n",
-					(int)(p_tcp_iov[0].p_desc->p_buffer - (uint8_t*)m_sge[0].addr), m_header.m_total_hdr_len,
-					p_tcp_iov[0].p_desc->p_buffer, p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.type,
-					p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.len, p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.tot_len,
-					p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.payload, hdr_alignment_diff);
-		}
+		bool initialized = false;
 
 		if (!dont_inline && (total_packet_len < m_max_inline)) { // inline send
 			m_p_send_wqe = &m_inline_send_wqe;
-
+			if (((struct pbuf *)p_tcp_iov->p_desc)->is_data_set) {
+				initialized = true;
+				m_p_send_wqe->num_sge = 2;
+				//m_header.m_header.hdr.m_ip_hdr.tot_len = (htons)(p_tcp_iov[0].iovec.iov_len + m_header.m_ip_header_len);
+				//
+				p_pkt = (tx_packet_template_t*)((uint8_t*)p_tcp_iov[0].iovec.iov_base - m_header.m_aligned_l2_l3_len);
+				m_header.copy_l2_ip_hdr(p_pkt);
+				p_pkt->hdr.m_ip_hdr.tot_len = (htons)(p_tcp_iov[0].iovec.iov_len + m_header.m_ip_header_len);
+				m_sge[0].addr = (uintptr_t)((uint8_t*)p_pkt + hdr_alignment_diff);
+				m_sge[0].length = m_header.m_total_hdr_len + sizeof(struct tcphdr);//total_packet_len;
+				m_sge[1].addr = (uintptr_t)(((struct pbuf*)p_tcp_iov->p_desc)->data);
+				m_sge[1].length = p_tcp_iov[0].iovec.iov_len - sizeof(struct tcphdr);
+			}
 		} else {
 			m_p_send_wqe = &m_not_inline_send_wqe;
+		}
+
+
+		if (!initialized) {
+			p_pkt = (tx_packet_template_t*)((uint8_t*)p_tcp_iov[0].iovec.iov_base - m_header.m_aligned_l2_l3_len);
+			m_header.copy_l2_ip_hdr(p_pkt);
+			// We've copied to aligned address, and now we must update p_pkt to point to real L2 header
+			p_pkt->hdr.m_ip_hdr.tot_len = (htons)(p_tcp_iov[0].iovec.iov_len + m_header.m_ip_header_len);
+			m_sge[0].addr = (uintptr_t)((uint8_t*)p_pkt + hdr_alignment_diff);
+			m_sge[0].length = total_packet_len;
+
+			/* for DEBUG */
+			/*if ((uint8_t*)m_sge[0].addr < p_tcp_iov[0].p_desc->p_buffer || (uint8_t*)p_pkt < p_tcp_iov[0].p_desc->p_buffer) {
+				dst_tcp_logerr("p_buffer - addr=%d, m_total_hdr_len=%zd, p_buffer=%p, type=%d, len=%d, tot_len=%d, payload=%p, hdr_alignment_diff=%zd\n",
+						(int)(p_tcp_iov[0].p_desc->p_buffer - (uint8_t*)m_sge[0].addr), m_header.m_total_hdr_len,
+						p_tcp_iov[0].p_desc->p_buffer, p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.type,
+						p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.len, p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.tot_len,
+						p_tcp_iov[0].p_desc->lwip_pbuf.pbuf.payload, hdr_alignment_diff);
+			}*/
 		}
 
 		m_p_send_wqe->wr_id = (uintptr_t)p_tcp_iov[0].p_desc;
@@ -127,6 +144,11 @@ ssize_t dst_entry_tcp::fast_send(const struct iovec* p_iov, const ssize_t sz_iov
 		dst_tcp_logfine("using SW checksum calculation: p_pkt->hdr.m_ip_hdr.check=%d, p_tcphdr->check=%d", (int)p_tcphdr->check, (int)p_pkt->hdr.m_ip_hdr.check);
 #endif
 		m_p_ring->send_lwip_buffer(m_id, m_p_send_wqe, b_blocked);
+
+		p_pkt = (tx_packet_template_t*)((uint8_t*)p_tcp_iov[0].iovec.iov_base - m_header.m_aligned_l2_l3_len);
+		m_header.copy_l2_ip_hdr(p_pkt);
+		p_pkt->hdr.m_ip_hdr.tot_len = (htons)(p_tcp_iov[0].iovec.iov_len + m_header.m_ip_header_len);
+
 	}
 	else { // We don'nt support inline in this case, since we believe that this a very rare case
 		p_mem_buf_desc = get_buffer(b_blocked);
