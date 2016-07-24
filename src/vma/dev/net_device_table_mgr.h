@@ -132,7 +132,9 @@ private:
     #pragma BullseyeCoverage on
 #endif
 
-	void 			verify_ipoib_mode(struct ifaddrs* ifa);
+	bool 			verify_ipoib_mode(struct ifaddrs* ifa);
+	bool			check_ib_device_supported(const char* ifname);
+	bool 			check_qp_creation(const char* ifname, enum ibv_qp_type);
 };
 
 extern net_device_table_mgr* g_p_net_device_table_mgr; 

@@ -253,11 +253,20 @@ int net_device_table_mgr::map_net_devices()
 			continue;
 		}
 
+		int iftype = get_iftype_from_ifname(ifa->ifa_name);
+		if (iftype == ARPHRD_INFINIBAND) {
+			if (!check_ib_device_supported(ifa->ifa_name) || !verify_ipoib_mode(ifa)) {
+				continue;
+			}
+		} else {
+			if (!check_qp_creation(ifa->ifa_name, IBV_QPT_RAW_PACKET)) {
+				continue;
+			}
+		}
 		// arriving here means this is an offloadable device and VMA need to create a net_device.
 		m_lock.lock();
 		net_device_val* p_net_device_val = NULL;
-		if (get_iftype_from_ifname(ifa->ifa_name) == ARPHRD_INFINIBAND) {
-			verify_ipoib_mode(ifa);
+		if (iftype == ARPHRD_INFINIBAND) {
 			p_net_device_val = new net_device_val_ib();
 		}
 		else {
@@ -298,7 +307,7 @@ int net_device_table_mgr::map_net_devices()
 
 // Verify IPoIB is in 'datagram mode' for proper VMA with flow steering operation
 // Also verify umcast is disabled for IB flow
-void net_device_table_mgr::verify_ipoib_mode(struct ifaddrs* ifa)
+bool net_device_table_mgr::verify_ipoib_mode(struct ifaddrs* ifa)
 {
 	char filename[256] = "\0";
 	char ifname[IFNAMSIZ] = "\0";
@@ -310,6 +319,7 @@ void net_device_table_mgr::verify_ipoib_mode(struct ifaddrs* ifa)
 		vlog_printf(VLOG_WARNING,"VMA doesn't support IPoIB in connected mode.\n");
 		vlog_printf(VLOG_WARNING,"Please refer to VMA Release Notes for more information\n");
 		vlog_printf(VLOG_WARNING,"************************************************************************\n");
+		return 0;
 	}
 	else {
 		ndtm_logdbg("verified interface '%s' is running in datagram mode", ifa->ifa_name);
@@ -323,10 +333,74 @@ void net_device_table_mgr::verify_ipoib_mode(struct ifaddrs* ifa)
 		vlog_printf(VLOG_WARNING,"This option in no longer needed in this version\n");
 		vlog_printf(VLOG_WARNING,"Please refer to Release Notes for more information\n");
 		vlog_printf(VLOG_WARNING,"************************************************************************\n");
+		return 0;
 	}
 	else {
 		ndtm_logdbg("verified interface '%s' is running with umcast disabled", ifa->ifa_name);
 	}
+	return 1;
+}
+
+bool net_device_table_mgr::check_ib_device_supported(const char* ifname) {
+	if (check_device_exist(ifname, CX4_DRIVER_PATH)) {
+		vlog_printf(VLOG_WARNING,"************************************************************************\n");
+		vlog_printf(VLOG_WARNING,"VMA doesn't support IB on CX4\n");
+		vlog_printf(VLOG_WARNING,"All traffic over interface %s will not be offloaded!\n", ifname);
+		vlog_printf(VLOG_WARNING,"************************************************************************\n");
+		return 0;
+	} else {
+		return check_qp_creation(ifname, IBV_QPT_UD);
+	}
+}
+
+bool net_device_table_mgr::check_qp_creation(const char* ifname, enum ibv_qp_type qp_type) {
+	int num_devices = 0;
+
+	struct ibv_qp_init_attr qp_init_attr;
+	memset(&qp_init_attr, 0, sizeof(qp_init_attr));
+
+	vma_ibv_cq_init_attr attr;
+	memset(&attr, 0, sizeof(attr));
+
+	qp_init_attr.cap.max_send_wr = safe_mce_sys().tx_num_wr;
+	qp_init_attr.cap.max_recv_wr = safe_mce_sys().rx_num_wr;
+	qp_init_attr.cap.max_inline_data = safe_mce_sys().tx_max_inline;
+	qp_init_attr.cap.max_send_sge = MCE_DEFAULT_TX_NUM_SGE;
+	qp_init_attr.cap.max_recv_sge = MCE_DEFAULT_RX_NUM_SGE;
+	qp_init_attr.sq_sig_all = 0;
+	qp_init_attr.qp_type = qp_type;
+
+	//find ib_cxt
+	char base_ifname[IFNAMSIZ];
+	get_base_interface_name((const char*)(ifname), base_ifname, sizeof(base_ifname));
+	struct ibv_context** pp_ibv_context_list = rdma_get_devices(&num_devices);
+	char resource_path[256];
+	sprintf(resource_path, VERBS_DEVICE_RESOURCE_PARAM_FILE, base_ifname);
+	char sys_res[1024] = {0};
+	priv_read_file(resource_path, sys_res, 1024);
+	for (int j=0; j<num_devices; j++) {
+		char ib_res[1024] = {0};
+		char ib_path[256] = {0};
+		sprintf(ib_path, "%s/device/resource", pp_ibv_context_list[j]->device->ibdev_path);
+		priv_read_file(ib_path, ib_res, 1024);
+		if (strcmp(sys_res, ib_res) == 0) {
+			ib_ctx_handler* p_ib_ctx = g_p_ib_ctx_handler_collection->get_ib_ctx(pp_ibv_context_list[j]);
+			struct ibv_comp_channel *channel = ibv_create_comp_channel(p_ib_ctx->get_ibv_context());
+			struct ibv_cq* cq = vma_ibv_create_cq(p_ib_ctx->get_ibv_context(), safe_mce_sys().tx_num_wr, (void*)this, channel, 0, &attr);
+			qp_init_attr.recv_cq = cq;
+			qp_init_attr.send_cq = cq;
+			struct ibv_qp* qp = ibv_create_qp(p_ib_ctx->get_ibv_pd(), &qp_init_attr);
+			if (!qp) {
+				vlog_printf(VLOG_WARNING,"************************************************************************\n");
+				vlog_printf(VLOG_WARNING,"QP creation failed on interface %s (errno=%d %m)\n", ifname, errno);
+				vlog_printf(VLOG_WARNING,"Traffic will not be offloaded on this interface.\n");
+				vlog_printf(VLOG_WARNING,"************************************************************************\n");
+				return 0;
+			}
+			break;
+		}
+	}
+	return 1;
 }
 
 net_device_val* net_device_table_mgr::get_net_device_val(in_addr_t local_addr)

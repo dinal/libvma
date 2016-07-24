@@ -231,6 +231,7 @@ void qp_mgr::down()
 	m_p_cq_mgr_rx->del_qp_rx(this);
 }
 
+//NOTE RAW_QP_PRIVLIGES_PARAM_FILE does not exist on ofed upstream
 void qp_mgr::validate_raw_qp_privliges()
 {
 	// Read the value stored for RAW QP root enforcement flag

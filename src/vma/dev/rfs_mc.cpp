@@ -39,7 +39,7 @@
 #define MODULE_NAME 		"rfs_mc"
 
 
-rfs_mc::rfs_mc(flow_tuple *flow_spec_5t, ring_simple *p_ring, rfs_rule_filter* rule_filter /*= NULL*/) : rfs (flow_spec_5t, p_ring, rule_filter)
+rfs_mc::rfs_mc(flow_tuple *flow_spec_5t, ring_simple *p_ring, rfs_rule_filter* rule_filter /*= NULL*/) throw (vma_exception): rfs (flow_spec_5t, p_ring, rule_filter)
 {
 	BULLSEYE_EXCLUDE_BLOCK_START
 	if (!m_flow_tuple.is_udp_mc()) {
@@ -47,10 +47,12 @@ rfs_mc::rfs_mc(flow_tuple *flow_spec_5t, ring_simple *p_ring, rfs_rule_filter* r
 	}
 	BULLSEYE_EXCLUDE_BLOCK_END
 
-	prepare_flow_spec();
+	if (!prepare_flow_spec()) {
+		throw_vma_exception("IB multicast offload is not supported");
+	}
 }
 
-void rfs_mc::prepare_flow_spec()
+int rfs_mc::prepare_flow_spec()
 {
 	transport_type_t type = m_p_ring->get_transport_type();
 
@@ -80,7 +82,7 @@ void rfs_mc::prepare_flow_spec()
 
 			p_attach_flow_data = (attach_flow_data_t*)attach_flow_data_ib;
 #else
-			rfs_logerr("IB multicast offload is not supported");
+			return 0;
 #endif
 			break;
 		case VMA_TRANSPORT_ETH:
@@ -113,11 +115,13 @@ void rfs_mc::prepare_flow_spec()
 		BULLSEYE_EXCLUDE_BLOCK_START
 		default:
 			rfs_logpanic("Incompatible transport type = %d", type);
+			return -1;
 			break;
 		BULLSEYE_EXCLUDE_BLOCK_END
 	}
 
 	m_attach_flow_data_vector.push_back(p_attach_flow_data);
+	return 1;
 }
 
 bool rfs_mc::rx_dispatch_packet(mem_buf_desc_t* p_rx_wc_buf_desc, void* pv_fd_ready_array)
