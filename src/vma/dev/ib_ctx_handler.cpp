@@ -55,14 +55,14 @@
 
 
 ib_ctx_handler::ib_ctx_handler(struct ibv_context* ctx, ts_conversion_mode_t ctx_time_converter_mode) :
-	m_removed(false), m_conf_attr_rx_num_wre(0), m_conf_attr_tx_num_to_signal(0),
+	m_device_valid(true), m_removed(false), m_conf_attr_rx_num_wre(0), m_conf_attr_tx_num_to_signal(0),
 	m_conf_attr_tx_max_inline(0), m_conf_attr_tx_num_wre(0), ctx_time_converter(ctx, ctx_time_converter_mode)
 {
 	memset(&m_ibv_port_attr, 0, sizeof(m_ibv_port_attr));
 	m_p_ibv_context = ctx;
-        m_p_ibv_device = ctx->device;
+    m_p_ibv_device = ctx->device;
 
-        BULLSEYE_EXCLUDE_BLOCK_START
+    BULLSEYE_EXCLUDE_BLOCK_START
 	if (m_p_ibv_device == NULL)
 		ibch_logpanic("ibv_device is NULL! (ibv context %p)", m_p_ibv_context);
 
@@ -80,6 +80,13 @@ ib_ctx_handler::ib_ctx_handler(struct ibv_context* ctx, ts_conversion_mode_t ctx
 		return;
 	} ENDIF_VERBS_FAILURE;
 	BULLSEYE_EXCLUDE_BLOCK_END
+
+	m_valid_ports = new int[m_ibv_device_attr.phys_port_cnt];
+	memset(m_valid_ports, 0, sizeof(int)*m_ibv_device_attr.phys_port_cnt);
+	if (!verify_qp_creation_on_ports()) {
+		m_device_valid = false;
+		return;
+	}
 
 	ibch_logdbg("ibv device '%s' [%p] has %d port%s. Vendor Part Id: %d, FW Ver: %s, max_qp_wr=%d, hca_core_clock (per sec)=%ld",
 			m_p_ibv_device->name, m_p_ibv_device, m_ibv_device_attr.phys_port_cnt, ((m_ibv_device_attr.phys_port_cnt>1)?"s":""),
@@ -99,6 +106,7 @@ ib_ctx_handler::~ib_ctx_handler() {
 	if (ibv_dealloc_pd(m_p_ibv_pd))
 		ibch_logdbg("pd deallocation failure (errno=%d %m)", errno);
 	BULLSEYE_EXCLUDE_BLOCK_END
+	delete m_valid_ports;
 }
 
 ts_conversion_mode_t ib_ctx_handler::get_ctx_time_converter_status() {
@@ -182,4 +190,87 @@ void ib_ctx_handler::handle_event_DEVICE_FATAL()
 {
 	m_removed = true;
 	g_p_event_handler_manager->unregister_ibverbs_event(m_p_ibv_context->async_fd, this);
+}
+
+bool ib_ctx_handler::verify_qp_creation_on_ports()
+{
+	bool found_one_valid_port = false;
+	//try to create qp on each port
+	for (int i=0; i < m_ibv_device_attr.phys_port_cnt; i++) {
+		update_port_attr(i);
+
+		bool qp_created = false;
+		struct ibv_cq* cq = NULL;
+		struct ibv_comp_channel *channel = NULL;
+		struct ibv_qp* qp = NULL;
+		errno=0;
+		struct ibv_qp_init_attr qp_init_attr;
+		memset(&qp_init_attr, 0, sizeof(qp_init_attr));
+
+		vma_ibv_cq_init_attr attr;
+		memset(&attr, 0, sizeof(attr));
+
+		qp_init_attr.cap.max_send_wr = safe_mce_sys().tx_num_wr;
+		qp_init_attr.cap.max_recv_wr = safe_mce_sys().rx_num_wr;
+		qp_init_attr.cap.max_inline_data = safe_mce_sys().tx_max_inline;
+		qp_init_attr.cap.max_send_sge = MCE_DEFAULT_TX_NUM_SGE;
+		qp_init_attr.cap.max_recv_sge = MCE_DEFAULT_RX_NUM_SGE;
+		qp_init_attr.sq_sig_all = 0;
+		if (m_ibv_port_attr.link_layer == IBV_LINK_LAYER_INFINIBAND) {
+			qp_init_attr.qp_type = IBV_QPT_UD;
+		} else {
+			qp_init_attr.qp_type = IBV_QPT_RAW_PACKET;
+		}
+
+		//create qp resources
+		channel = ibv_create_comp_channel(m_p_ibv_context);
+		if (channel) {
+			cq = vma_ibv_create_cq(m_p_ibv_context, safe_mce_sys().tx_num_wr, (void*)this, channel, 0, &attr);
+			if (cq) {
+				qp_init_attr.recv_cq = cq;
+				qp_init_attr.send_cq = cq;
+				qp = ibv_create_qp(m_p_ibv_pd, &qp_init_attr);
+				if (qp) {
+					qp_created = true;
+				} else {
+					ibch_logdbg("QP creation failed on device %s (errno=%d %m), Traffic will not be offloaded \n", m_p_ibv_context->device->dev_name, errno);
+					m_valid_ports[i] = errno;
+				}
+			} else {
+				ibch_logdbg("cq creation failed for device %s (errno=%d %m)", m_p_ibv_context->device->dev_name, errno);
+			}
+		} else {
+			ibch_logdbg("channel creation failed for device %s (errno=%d %m)", m_p_ibv_context->device->dev_name, errno);
+		}
+		//release resources
+		if(qp) {
+			IF_VERBS_FAILURE(ibv_destroy_qp(qp)) {
+				ibch_logdbg("qp destroy failed on device %s (errno=%d %m)", m_p_ibv_context->device->dev_name, errno);
+				qp_created = false;
+			} ENDIF_VERBS_FAILURE;
+		}
+		if (cq) {
+			IF_VERBS_FAILURE(ibv_destroy_cq(cq)) {
+				ibch_logdbg("cq destroy failed on device %s (errno=%d %m)", m_p_ibv_context->device->dev_name, errno);
+				qp_created = false;
+			} ENDIF_VERBS_FAILURE;
+		}
+		if (channel) {
+			IF_VERBS_FAILURE(ibv_destroy_comp_channel(channel)) {
+				ibch_logdbg("channel destroy failed on device %s (errno=%d %m)", m_p_ibv_context->device->dev_name, errno);
+				qp_created = false;
+			} ENDIF_VERBS_FAILURE;
+		}
+
+		if (!qp_created && !m_valid_ports[i]) {
+			m_valid_ports[i] = -1;
+		}
+		found_one_valid_port |= qp_created;
+	}
+	return found_one_valid_port;
+}
+
+//return qp errno if not valid
+int ib_ctx_handler::port_qp_creation_errno(int port_num) {
+	return m_valid_ports[port_num - 1];
 }

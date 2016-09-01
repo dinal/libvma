@@ -197,7 +197,7 @@ void buffer_pool::free_bpool_resources()
 	for (iter_mrs = m_mrs.begin(); iter_mrs != m_mrs.end(); ++iter_mrs) {
 		ibv_mr *mr = *iter_mrs;
 		ib_ctx_handler* p_ib_ctx_handler = g_p_ib_ctx_handler_collection->get_ib_ctx(mr->context); 
-		if (!p_ib_ctx_handler->is_removed()) {
+		if (p_ib_ctx_handler == NULL || !p_ib_ctx_handler->is_removed()) {
 			IF_VERBS_FAILURE(ibv_dereg_mr(mr)) {
 				__log_info_err("failed de-registering a memory region (errno=%d %m)", errno);
 			} ENDIF_VERBS_FAILURE;

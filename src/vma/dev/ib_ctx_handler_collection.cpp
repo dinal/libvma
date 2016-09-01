@@ -65,7 +65,9 @@ void ib_ctx_handler_collection::free_ibchc_resources()
 	ib_context_map_t::iterator ib_ctx_iter;
 	while ((ib_ctx_iter = m_ib_ctx_map.begin()) != m_ib_ctx_map.end()) {
 		ib_ctx_handler* p_ib_ctx_handler = ib_ctx_iter->second;
-		delete p_ib_ctx_handler;
+		if (p_ib_ctx_handler!= NULL) {
+			delete p_ib_ctx_handler;
+		}
 		m_ib_ctx_map.erase(ib_ctx_iter);
 	}
 }
@@ -106,7 +108,7 @@ void ib_ctx_handler_collection::map_ib_devices() //return num_devices, can use r
 
 ib_ctx_handler* ib_ctx_handler_collection::get_ib_ctx(struct ibv_context* p_ibv_context)
 {
-	if (m_ib_ctx_map.count(p_ibv_context) > 0)
+	if (m_ib_ctx_map.count(p_ibv_context) > 0 && m_ib_ctx_map[p_ibv_context]->m_device_valid)
 		return m_ib_ctx_map[p_ibv_context];
 	return NULL;
 }

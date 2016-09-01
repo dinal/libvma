@@ -62,10 +62,13 @@ public:
 	virtual void            handle_event_ibverbs_cb(void *ev_data, void *ctx);
 	void                    handle_event_DEVICE_FATAL();
 	ts_conversion_mode_t    get_ctx_time_converter_status();
+	int 					port_qp_creation_errno(int port_num);
 
 	inline void convert_hw_time_to_system_time(uint64_t packet_hw_time, struct timespec* packet_systime) {
 		ctx_time_converter.convert_hw_time_to_system_time(packet_hw_time, packet_systime);
 	}
+
+	bool					m_device_valid;
 
 private:
 	struct ibv_context*     m_p_ibv_context;
@@ -76,6 +79,7 @@ private:
 	bool                    m_removed;
 
 	bool                    update_port_attr(int port_num);
+	bool 					verify_qp_creation_on_ports();
 
 	//void handle_ibv_event(struct ibv_async_event ibv_event); // will be called by the command execute
 	//
@@ -86,6 +90,8 @@ private:
 	uint32_t                m_conf_attr_tx_num_wre;
 
 	ib_ctx_time_converter  ctx_time_converter;
+
+	int* m_valid_ports; //each cell is either 0 for valid port or contains the errno of a non valid ports
 };
 
 #endif

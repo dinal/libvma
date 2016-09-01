@@ -250,7 +250,7 @@ int net_device_table_mgr::map_net_devices()
 			// this is a bond interface (or a vlan/alias over bond), find the slaves
 			valid = verify_bond_ipoib_or_eth_qp_creation(ifa);
 		} else {
-			valid = verify_ipoib_or_eth_qp_creation(ifa->ifa_name, ifa);
+			valid = verify_ipoib_or_eth_qp_creation(ifa->ifa_name, ifa, cma_id->port_num);
 		}
 		if (!valid) {
 			// Close the cma_id which will not be offload
@@ -320,7 +320,7 @@ bool net_device_table_mgr::verify_bond_ipoib_or_eth_qp_creation(struct ifaddrs *
 	{
 		char* p = strchr(slave_name, '\n');
 		if (p) *p = '\0'; // Remove the tailing 'new line" char
-		if (!verify_ipoib_or_eth_qp_creation(slave_name, ifa)) {
+		if (!verify_ipoib_or_eth_qp_creation(slave_name, ifa, 0)) { //TODO use real port number
 			//check all slaves but print only once for bond
 			bond_ok =  false;
 		}
@@ -336,7 +336,7 @@ bool net_device_table_mgr::verify_bond_ipoib_or_eth_qp_creation(struct ifaddrs *
 }
 
 //interface name can be slave while ifa struct can describe bond
-bool net_device_table_mgr::verify_ipoib_or_eth_qp_creation(const char* interface_name, struct ifaddrs * ifa)
+bool net_device_table_mgr::verify_ipoib_or_eth_qp_creation(const char* interface_name, struct ifaddrs * ifa, int port_num)
 {
 	int iftype = get_iftype_from_ifname(interface_name);
 	if (iftype == ARPHRD_INFINIBAND) {
@@ -344,9 +344,49 @@ bool net_device_table_mgr::verify_ipoib_or_eth_qp_creation(const char* interface
 			return true;
 		}
 	} else {
-		if (verify_eth_qp_creation(interface_name)) {
-			return true;
+		// check if ib_device exists
+		int num_devices;
+		char base_ifname[IFNAMSIZ];
+		get_base_interface_name((const char*)(interface_name), base_ifname, sizeof(base_ifname));
+		struct ibv_context** pp_ibv_context_list = rdma_get_devices(&num_devices);
+		char resource_path[256];
+		sprintf(resource_path, VERBS_DEVICE_RESOURCE_PARAM_FILE, base_ifname);
+		char sys_res[1024] = {0};
+		priv_safe_read_file(resource_path, sys_res, 1024);
+		for (int j=0; j<num_devices; j++) {
+			char ib_res[1024] = {0};
+			char ib_path[256] = {0};
+			sprintf(ib_path, "%s/device/resource", pp_ibv_context_list[j]->device->ibdev_path);
+			priv_safe_read_file(ib_path, ib_res, 1024);
+			if (strcmp(sys_res, ib_res) == 0) {
+				ib_ctx_handler* ctx = g_p_ib_ctx_handler_collection->get_ib_ctx(pp_ibv_context_list[j]);
+				if (ctx != NULL && !ctx->port_qp_creation_errno(port_num)) {
+					rdma_free_devices(pp_ibv_context_list);
+					return true;
+				} else {
+					if (validate_raw_qp_privliges() == 0) {
+						//// MLNX_OFED raw_qp_privliges file exist with bad value
+						vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
+						vlog_printf(VLOG_WARNING,"* Interface %s will not be offloaded.\n", interface_name);
+						vlog_printf(VLOG_WARNING,"* Working in this mode might causes VMA malfunction over Ethernet interfaces\n");
+						vlog_printf(VLOG_WARNING,"* WARNING: the following steps will restart your network interface!\n");
+						vlog_printf(VLOG_WARNING,"* 1. \"echo options ib_uverbs disable_raw_qp_enforcement=1 > /etc/modprobe.d/ib_uverbs.conf\"\n");
+						vlog_printf(VLOG_WARNING,"* 2. \"/etc/init.d/openibd restart\"\n");
+						vlog_printf(VLOG_WARNING,"* Read the RAW_PACKET QP root access enforcement section in the VMA's User Manual for more information\n");
+						vlog_printf(VLOG_WARNING,"******************************************************************************************************\n");
+					}
+					else if (ctx->port_qp_creation_errno(port_num) == EPERM) {
+						// file doesn't exists, print msg if errno is a permission problem
+						vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
+						vlog_printf(VLOG_WARNING,"* Interface %s will not be offloaded.\n", interface_name);
+						vlog_printf(VLOG_WARNING,"* Offloaded resources are restricted to root or user with CAP_NET_RAW privileges\n");
+						vlog_printf(VLOG_WARNING,"* Read the CAP_NET_RAW and root access section in the VMA's User Manual for more information\n");
+						vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
+					}
+				}
+			}
 		}
+		rdma_free_devices(pp_ibv_context_list);
 	}
 	return false;
 }
@@ -399,120 +439,14 @@ bool net_device_table_mgr::verify_ipoib_mode(struct ifaddrs* ifa)
 bool net_device_table_mgr::verify_mlx4_ib_device(const char* ifname)
 {
 	if (!check_device_exist(ifname, MLX4_DRIVER_PATH)) {
-		vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
+		ndtm_logdbg("*******************************************************************************************************\n");
 		ndtm_logdbg("* Flow Steering of IPoIB traffic is not supported on your HCA");
 		ndtm_logdbg("* Please refer to VMA Release Notes for details limitations.");
 		ndtm_logdbg("* All traffic over interface %s will not be offloaded!", ifname);
-		vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
+		ndtm_logdbg("*******************************************************************************************************\n");
 		return false;
 	}
 	return true;
-}
-
-//ifname should point to a physical device
-bool net_device_table_mgr::verify_eth_qp_creation(const char* ifname)
-{
-	int num_devices = 0;
-	bool success = false;
-	struct ibv_cq* cq = NULL;
-	struct ibv_comp_channel *channel = NULL;
-	struct ibv_qp* qp = NULL;
-
-	struct ibv_qp_init_attr qp_init_attr;
-	memset(&qp_init_attr, 0, sizeof(qp_init_attr));
-
-	vma_ibv_cq_init_attr attr;
-	memset(&attr, 0, sizeof(attr));
-
-	qp_init_attr.cap.max_send_wr = safe_mce_sys().tx_num_wr;
-	qp_init_attr.cap.max_recv_wr = safe_mce_sys().rx_num_wr;
-	qp_init_attr.cap.max_inline_data = safe_mce_sys().tx_max_inline;
-	qp_init_attr.cap.max_send_sge = MCE_DEFAULT_TX_NUM_SGE;
-	qp_init_attr.cap.max_recv_sge = MCE_DEFAULT_RX_NUM_SGE;
-	qp_init_attr.sq_sig_all = 0;
-	qp_init_attr.qp_type = IBV_QPT_RAW_PACKET;
-
-	//find ib_cxt
-	char base_ifname[IFNAMSIZ];
-	get_base_interface_name((const char*)(ifname), base_ifname, sizeof(base_ifname));
-	struct ibv_context** pp_ibv_context_list = rdma_get_devices(&num_devices);
-	char resource_path[256];
-	sprintf(resource_path, VERBS_DEVICE_RESOURCE_PARAM_FILE, base_ifname);
-	char sys_res[1024] = {0};
-	priv_safe_read_file(resource_path, sys_res, 1024);
-	for (int j=0; j<num_devices; j++) {
-		char ib_res[1024] = {0};
-		char ib_path[256] = {0};
-		sprintf(ib_path, "%s/device/resource", pp_ibv_context_list[j]->device->ibdev_path);
-		priv_safe_read_file(ib_path, ib_res, 1024);
-		if (strcmp(sys_res, ib_res) == 0) {
-			//create qp resources
-			ib_ctx_handler* p_ib_ctx = g_p_ib_ctx_handler_collection->get_ib_ctx(pp_ibv_context_list[j]);
-			channel = ibv_create_comp_channel(p_ib_ctx->get_ibv_context());
-			if (!channel) {
-				ndtm_logdbg("channel creation failed for interface %s (errno=%d %m)", ifname, errno);
-				success = false;
-				break;
-			}
-			cq = vma_ibv_create_cq(p_ib_ctx->get_ibv_context(), safe_mce_sys().tx_num_wr, (void*)this, channel, 0, &attr);
-			if (!cq) {
-				ndtm_logdbg("cq creation failed for interface %s (errno=%d %m)", ifname, errno);
-				success = false;
-				break;
-			}
-			qp_init_attr.recv_cq = cq;
-			qp_init_attr.send_cq = cq;
-			qp = ibv_create_qp(p_ib_ctx->get_ibv_pd(), &qp_init_attr);
-			if (qp) {
-				success = true;
-			} else {
-				ndtm_logdbg("QP creation failed on interface %s (errno=%d %m), Traffic will not be offloaded \n", ifname, errno);
-				success = false;
-				int err = errno; //verify_raw_qp_privliges can overwrite errno so keep it before the call
-				if (validate_raw_qp_privliges() == 0) {
-					//// MLNX_OFED raw_qp_privliges file exist with bad value
-					vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
-					vlog_printf(VLOG_WARNING,"* Interface %s will not be offloaded.\n", ifname);
-					vlog_printf(VLOG_WARNING,"* Working in this mode might causes VMA malfunction over Ethernet interfaces\n");
-					vlog_printf(VLOG_WARNING,"* WARNING: the following steps will restart your network interface!\n");
-					vlog_printf(VLOG_WARNING,"* 1. \"echo options ib_uverbs disable_raw_qp_enforcement=1 > /etc/modprobe.d/ib_uverbs.conf\"\n");
-					vlog_printf(VLOG_WARNING,"* 2. \"/etc/init.d/openibd restart\"\n");
-					vlog_printf(VLOG_WARNING,"* Read the RAW_PACKET QP root access enforcement section in the VMA's User Manual for more information\n");
-					vlog_printf(VLOG_WARNING,"******************************************************************************************************\n");
-				}
-				else if (err == EPERM) {
-					// file doesn't exists, print msg if errno is a permission problem
-					vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
-					vlog_printf(VLOG_WARNING,"* Interface %s will not be offloaded.\n", ifname);
-					vlog_printf(VLOG_WARNING,"* Offloaded resources are restricted to root or user with CAP_NET_RAW privileges\n");
-					vlog_printf(VLOG_WARNING,"* Read the CAP_NET_RAW and root access section in the VMA's User Manual for more information\n");
-					vlog_printf(VLOG_WARNING,"*******************************************************************************************************\n");
-				}
-			}
-			break;
-		}
-	}
-	//release resources
-	if(qp) {
-		IF_VERBS_FAILURE(ibv_destroy_qp(qp)) {
-			ndtm_logdbg("qp destroy failed on interface %s (errno=%d %m)", ifname, errno);
-			success = false;
-		} ENDIF_VERBS_FAILURE;
-	}
-	if (cq) {
-		IF_VERBS_FAILURE(ibv_destroy_cq(cq)) {
-			ndtm_logdbg("cq destroy failed on interface %s (errno=%d %m)", ifname, errno);
-			success = false;
-		} ENDIF_VERBS_FAILURE;
-	}
-	if (channel) {
-		IF_VERBS_FAILURE(ibv_destroy_comp_channel(channel)) {
-			ndtm_logdbg("channel destroy failed on interface %s (errno=%d %m)", ifname, errno);
-			success = false;
-		} ENDIF_VERBS_FAILURE;
-	}
-	rdma_free_devices(pp_ibv_context_list);
-	return success;
 }
 
 net_device_val* net_device_table_mgr::get_net_device_val(in_addr_t local_addr)
